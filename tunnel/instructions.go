@@ -30,6 +30,12 @@ import (
 
 var instructionOpcodes = map[uint32]reflect.Type{}
 
+var (
+	opTCPConnect uint32
+	opTCPData    uint32
+	opTCPClose   uint32
+)
+
 func init() {
 	tl.Register(EncryptedMessage{}, "adnlTunnel.encryptedMessage tunnelPubKey:int256 seqno:int instructions:bytes payload:bytes = adnlTunnel.EncryptedMessage")
 	tl.Register(EncryptedMessageCached{}, "adnlTunnel.encryptedMessageCached tunnelPubKey:int256 seqno:int payload:bytes = adnlTunnel.EncryptedMessage")
@@ -53,6 +59,16 @@ func init() {
 	instructionOpcodes[tl.Register(SendOutInstruction{}, "adnlTunnel.sendOutInstruction = adnlTunnel.Instruction")] = reflect.TypeOf(SendOutInstruction{})
 	instructionOpcodes[tl.Register(DeliverInstruction{}, "adnlTunnel.deliverInstruction = adnlTunnel.Instruction")] = reflect.TypeOf(DeliverInstruction{})
 	instructionOpcodes[tl.Register(DeliverInitiatorInstruction{}, "adnlTunnel.deliverInitiatorInstruction from:int metadata:bytes = adnlTunnel.Instruction")] = reflect.TypeOf(DeliverInitiatorInstruction{})
+
+	opTCPConnect = tl.Register(TCPConnectPayload{}, "adnlTunnel.tcpConnectPayload seqno:long connId:int host:bytes port:int = adnlTunnel.TCPConnectPayload")
+	opTCPData = tl.Register(TCPDataPayload{}, "adnlTunnel.tcpDataPayload seqno:long connId:int data:bytes fin:Bool = adnlTunnel.TCPDataPayload")
+	opTCPClose = tl.Register(TCPClosePayload{}, "adnlTunnel.tcpClosePayload seqno:long connId:int = adnlTunnel.TCPClosePayload")
+	tl.Register(TCPOutBindDonePayload{}, "adnlTunnel.tcpOutBindDonePayload seqno:long = adnlTunnel.TCPOutBindDonePayload")
+	tl.Register(TCPConnectedPayload{}, "adnlTunnel.tcpConnectedPayload seqno:long connId:int = adnlTunnel.TCPConnectedPayload")
+	tl.Register(TCPCloseResponsePayload{}, "adnlTunnel.tcpCloseResponsePayload seqno:long connId:int reason:int = adnlTunnel.TCPCloseResponsePayload")
+
+	instructionOpcodes[tl.Register(BindTCPOutInstruction{}, "adnlTunnel.bindTCPOutInstruction inboundNodeADNL:int256 inboundSectionPubKey:int256 inboundInstructions:bytes receiverPubKey:int256 = adnlTunnel.Instruction")] = reflect.TypeOf(BindTCPOutInstruction{})
+	instructionOpcodes[tl.Register(SendTCPOutInstruction{}, "adnlTunnel.sendTCPOutInstruction = adnlTunnel.Instruction")] = reflect.TypeOf(SendTCPOutInstruction{})
 }
 
 type PingMeta struct {
@@ -231,6 +247,8 @@ func (ins CacheInstruction) Execute(ctx context.Context, s *Section, msg *Encryp
 			})
 		case *SendOutInstruction:
 			list = append(list, &SendOutCachedAction{})
+		case *SendTCPOutInstruction:
+			list = append(list, SendTCPOutCachedAction{})
 		case *RouteInstruction:
 			s.mx.RLock()
 			route := s.routes[v.RouteID]
@@ -271,6 +289,15 @@ type BuildRouteInstruction struct {
 	RouteID             uint32 `tl:"int"`
 	PricePerPacket      uint64 `tl:"long"`
 }
+
+const (
+	TCPCloseDone    = 0
+	TCPCloseRefused = 1
+	TCPCloseTimeout = 2
+	TCPClosePolicy  = 3
+	TCPCloseError   = 4
+	TCPCloseLimit   = 5
+)
 
 const FreePacketsMaxPS = 10
 const FreePacketsMaxPSBurst = FreePacketsMaxPS * 2
@@ -800,6 +827,128 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 	return nil
 }
 
+// BindTCPOutInstruction initializes TCP clearnet exit capability on a section
+type BindTCPOutInstruction struct {
+	InboundNodeADNL      []byte `tl:"int256"`
+	InboundSectionPubKey []byte `tl:"int256"`
+	InboundInstructions  []byte `tl:"bytes"`
+	ReceiverPubKey       []byte `tl:"int256"`
+	PricePerPacket       uint64 `tl:"long"` // not in TL string, follows BindOutInstruction pattern
+}
+
+func (ins BindTCPOutInstruction) Execute(ctx context.Context, s *Section, msg *EncryptedMessage, restInstructions []byte) error {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	if !s.gw.allowClearnet {
+		return fmt.Errorf("clearnet exit is not enabled on this node")
+	}
+
+	gateAddresses := s.gw.gate.GetAddressList().Addresses
+	if len(gateAddresses) == 0 {
+		return fmt.Errorf("no external addresses in gate")
+	}
+
+	sharedPayloadKey, err := keys.SharedKey(s.gw.key, ins.ReceiverPubKey)
+	if err != nil {
+		return fmt.Errorf("calculate shared_payload key for tcp out failed: %w", err)
+	}
+
+	if s.gw.payments.Service != nil && s.gw.payments.MinPricePerPacketInOut > ins.PricePerPacket {
+		return fmt.Errorf("too low price per packet: %d, min is %d", ins.PricePerPacket, s.gw.payments.MinPricePerPacketInOut)
+	}
+
+	if s.gw.payments.Service == nil {
+		ins.PricePerPacket = 0
+	}
+
+	if s.tcpOut == nil {
+		closer, cancel := context.WithCancel(context.Background())
+		s.tcpOut = &TCPOut{
+			gw:                  s.gw,
+			inboundPeer:         s.gw.addPeer(ins.InboundNodeADNL, nil),
+			closer:              closer,
+			closerClose:         cancel,
+			InboundADNL:         ins.InboundNodeADNL,
+			PayloadCipherKey:    sharedPayloadKey,
+			PayloadCipherKeyCRC: crc64.Checksum(sharedPayloadKey, crcTable),
+			InboundSectionKey:   ins.InboundSectionPubKey,
+			Instructions:        ins.InboundInstructions,
+			conns:               make(map[uint32]*tcpConn),
+			maxConns:            s.gw.maxTCPConns,
+			portPolicy:          s.gw.clearnetPorts,
+			ipBlacklist:         s.gw.clearnetBlacklist,
+			PricePerChunk:       new(big.Int).SetUint64(ins.PricePerPacket),
+			log:                 s.log.With().Str("component", "tcp_out").Logger(),
+		}
+
+		s.tcpOut.inboundPeer.AddReference()
+
+		s.log.Info().
+			Str("back_addr", s.tcpOut.inboundPeer.getAddr()).
+			Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
+			Msg("tcp out allocated")
+	} else {
+		s.tcpOut.mx.Lock()
+		inADNLChanged := !bytes.Equal(s.tcpOut.InboundADNL, ins.InboundNodeADNL)
+		changed := inADNLChanged ||
+			!bytes.Equal(s.tcpOut.PayloadCipherKey, sharedPayloadKey) ||
+			s.tcpOut.PayloadCipherKeyCRC != crc64.Checksum(sharedPayloadKey, crcTable) ||
+			!bytes.Equal(s.tcpOut.InboundSectionKey, ins.InboundSectionPubKey) ||
+			!bytes.Equal(s.tcpOut.Instructions, ins.InboundInstructions) ||
+			s.tcpOut.PricePerChunk.Cmp(new(big.Int).SetUint64(ins.PricePerPacket)) != 0
+
+		if changed {
+			if inADNLChanged {
+				s.tcpOut.inboundPeer.Dereference()
+				s.tcpOut.inboundPeer = s.gw.addPeer(ins.InboundNodeADNL, nil)
+				s.tcpOut.inboundPeer.AddReference()
+			}
+
+			s.tcpOut.InboundADNL = ins.InboundNodeADNL
+			s.tcpOut.PayloadCipherKey = sharedPayloadKey
+			s.tcpOut.PayloadCipherKeyCRC = crc64.Checksum(sharedPayloadKey, crcTable)
+			s.tcpOut.InboundSectionKey = ins.InboundSectionPubKey
+			s.tcpOut.Instructions = ins.InboundInstructions
+			s.tcpOut.PricePerChunk = new(big.Int).SetUint64(ins.PricePerPacket)
+
+			s.log.Info().
+				Str("back_addr", s.tcpOut.inboundPeer.getAddr()).
+				Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
+				Msg("tcp out reconfigured")
+		}
+		s.tcpOut.mx.Unlock()
+	}
+
+	if err = s.tcpOut.sendBack(TCPOutBindDonePayload{
+		Seqno: 0,
+	}, false); err != nil {
+		s.log.Debug().Err(err).Msg("send back tcp bind done failed")
+	}
+
+	return nil
+}
+
+// SendTCPOutInstruction dispatches TCP payloads to TCPOut (cacheable)
+type SendTCPOutInstruction struct{}
+
+func (ins SendTCPOutInstruction) Execute(ctx context.Context, s *Section, msg *EncryptedMessage, _ []byte) error {
+	if s.tcpOut == nil {
+		return fmt.Errorf("tcp out is not initialized")
+	}
+	return s.tcpOut.Send(msg.Payload)
+}
+
+// SendTCPOutCachedAction is the cached version of SendTCPOutInstruction
+type SendTCPOutCachedAction struct{}
+
+func (c SendTCPOutCachedAction) Execute(ctx context.Context, s *Section, msg *EncryptedMessageCached) error {
+	if s.tcpOut == nil {
+		return fmt.Errorf("tcp out is not initialized")
+	}
+	return s.tcpOut.Send(msg.Payload)
+}
+
 // ReportStatsInstruction is used to get network statistics from some node,
 // for example to calc packet loss or align payment amount
 type ReportStatsInstruction struct {
@@ -910,6 +1059,40 @@ type SendOutPayload struct {
 	IP      []byte `tl:"bytes"`
 	Port    uint32 `tl:"int"`
 	Payload []byte `tl:"bytes"`
+}
+
+type TCPConnectPayload struct {
+	Seqno  uint64 `tl:"long"`
+	ConnId uint32 `tl:"int"`
+	Host   []byte `tl:"bytes"`
+	Port   uint32 `tl:"int"`
+}
+
+type TCPDataPayload struct {
+	Seqno  uint64 `tl:"long"`
+	ConnId uint32 `tl:"int"`
+	Data   []byte `tl:"bytes"`
+	Fin    bool   `tl:"bool"`
+}
+
+type TCPClosePayload struct {
+	Seqno  uint64 `tl:"long"`
+	ConnId uint32 `tl:"int"`
+}
+
+type TCPOutBindDonePayload struct {
+	Seqno uint64 `tl:"long"`
+}
+
+type TCPConnectedPayload struct {
+	Seqno  uint64 `tl:"long"`
+	ConnId uint32 `tl:"int"`
+}
+
+type TCPCloseResponsePayload struct {
+	Seqno  uint64 `tl:"long"`
+	ConnId uint32 `tl:"int"`
+	Reason uint32 `tl:"int"`
 }
 
 func (o *Out) Close() {

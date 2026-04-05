@@ -23,6 +23,7 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments/db/leveldb"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	adnlTransport "github.com/xssnick/ton-payment-network/tonpayments/transport/adnl"
+	paymentMetrics "github.com/xssnick/ton-payment-network/tonpayments/metrics"
 	pWallet "github.com/xssnick/ton-payment-network/tonpayments/wallet"
 	tonaddr "github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/adnl"
@@ -48,6 +49,7 @@ var ConfigPath = flag.String("config", "config.json", "Config path")
 var PaymentNodeWith = flag.String("payment-node", "", "Payment node to open channel with")
 var Verbosity = flag.Int("v", 2, "verbosity")
 var GenerateSharedExample = flag.String("gen-shared-config", "", "Will generate shared config file with current node, at specified path")
+var clearnetExit = flag.Bool("clearnet-exit", false, "Enable clearnet TCP exit mode (dual: relay + exit)")
 
 var LogFilename = flag.String("log-filename", "tunnel.log", "log file name")
 var LogMaxSize = flag.Int("log-max-size", 1024, "maximum log file size in MB before rotation")
@@ -62,6 +64,11 @@ var GitCommit = "dev"
 
 func main() {
 	flag.Parse()
+
+	// Enable ADNL debug logging to see handshake errors
+	adnl.Logger = func(v ...any) {
+		fmt.Println("ADNL:", fmt.Sprint(v...))
+	}
 
 	// logs rotation
 	var logWriters = []io.Writer{zerolog.NewConsoleWriter()}
@@ -130,6 +137,10 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load config")
 		return
+	}
+
+	if *clearnetExit {
+		cfg.AllowClearnetExit = true
 	}
 
 	if *GenerateSharedExample != "" {
@@ -242,7 +253,7 @@ func main() {
 	if *Verbosity >= 3 {
 		lvl = zerolog.DebugLevel
 	}
-	tGate := tunnel.NewGateway(gate, dhtClient, tunKey, log.With().Str("component", "gateway").Logger().Level(lvl), pmt)
+	tGate := tunnel.NewGateway(gate, dhtClient, tunKey, log.With().Str("component", "gateway").Logger().Level(lvl), pmt, cfg.AllowClearnetExit)
 	go func() {
 		if err = tGate.Start(); err != nil {
 			log.Fatal().Err(err).Msg("tunnel gateway failed")
@@ -458,9 +469,42 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	serverPrv := ed25519.NewKeyFromSeed(cfg.Payments.ADNLServerKey)
 	gate := adnl.NewGateway(serverPrv)
 
-	if err := gate.StartClient(); err != nil {
-		log.Fatal().Err(err).Msg("failed to init adnl payments gateway")
-		return nil, nil, nil
+	if cfg.ExternalIP != "" {
+		// Use a fixed port (tunnel port + 1) so DHT records remain valid across restarts
+		listenAddr, _ := netip.ParseAddrPort(cfg.TunnelListenAddr)
+		paymentPort := int32(listenAddr.Port()) + 1
+		paymentListenAddr := fmt.Sprintf("0.0.0.0:%d", paymentPort)
+
+		// Custom connector to bind to fixed port instead of random
+		gate = adnl.NewGatewayWithNetManager(serverPrv, adnl.NewSingleNetReader(func(addr string) (net.PacketConn, error) {
+			conn, err := net.ListenPacket("udp", paymentListenAddr)
+			if err != nil {
+				return nil, err
+			}
+			log.Info().Str("local", conn.LocalAddr().String()).Msg("payment gateway UDP socket bound")
+			return adnl.NewSyncConn(conn, adnl.PacketsBufferSize), nil
+		}))
+
+		ip := net.ParseIP(cfg.ExternalIP)
+		if ip != nil {
+			gate.SetAddressList([]*address.UDP{
+				{
+					IP:   ip.To4(),
+					Port: paymentPort,
+				},
+			})
+		}
+
+		if err := gate.StartClient(); err != nil {
+			log.Fatal().Err(err).Msg("failed to init adnl payments gateway")
+			return nil, nil, nil
+		}
+		log.Info().Int32("port", paymentPort).Msg("payment gateway started")
+	} else {
+		if err := gate.StartClient(); err != nil {
+			log.Fatal().Err(err).Msg("failed to init adnl payments gateway")
+			return nil, nil, nil
+		}
 	}
 
 	ldb, freshDb, err := leveldb.NewLevelDB(cfg.Payments.DBPath)
@@ -528,6 +572,10 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 		return nil, nil, nil
 	}
 	log.Info().Str("addr", w.WalletAddress().String()).Msg("wallet initialized")
+
+	if *MetricsAddr != "" {
+		paymentMetrics.RegisterMetrics("payment")
+	}
 
 	svc, err := tonpayments.NewService(chainClient.NewTON(apiClient), fdb, tr, nil, w, inv, nodePrv, cfg.Payments.ChannelsConfig, *MetricsAddr != "")
 	if err != nil {

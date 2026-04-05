@@ -123,6 +123,7 @@ type Section struct {
 	cipherKeyCrc uint64
 	routes       map[uint32]*Route
 	out          *Out
+	tcpOut       *TCPOut // TCP clearnet exit (nil if not initialized)
 
 	cachedActions    []CachedAction
 	cachedActionsVer uint64
@@ -138,12 +139,16 @@ type Section struct {
 }
 
 type Gateway struct {
-	gate         *adnl.Gateway
-	key          ed25519.PrivateKey
-	dht          *dht.Client
-	allowRouting bool
-	allowOut     bool
-	paymentNode  []byte
+	gate          *adnl.Gateway
+	key           ed25519.PrivateKey
+	dht           *dht.Client
+	allowRouting  bool
+	allowOut      bool
+	allowClearnet    bool
+	clearnetPorts    map[int]bool
+	maxTCPConns      int
+	clearnetBlacklist []*net.IPNet
+	paymentNode      []byte
 
 	activePeers map[string]*Peer
 
@@ -193,7 +198,7 @@ type PaymentConfig struct {
 	MinPricePerPacketInOut uint64
 }
 
-func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, logger zerolog.Logger, pay PaymentConfig) *Gateway {
+func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, logger zerolog.Logger, pay PaymentConfig, allowClearnet bool) *Gateway {
 	ctx, cancel := context.WithCancel(context.Background())
 	g := &Gateway{
 		gate:             gate,
@@ -201,7 +206,11 @@ func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, log
 		dht:              dht,
 		allowRouting:     true,
 		allowOut:         true,
-		paymentNode:      nil,
+		allowClearnet:     allowClearnet,
+		clearnetPorts:     defaultClearnetPorts(),
+		maxTCPConns:       64,
+		clearnetBlacklist: defaultClearnetBlacklist(),
+		paymentNode:       nil,
 		activePeers:      map[string]*Peer{},
 		signalCheckPeers: make(chan struct{}, 1),
 		closerCtx:        ctx,
@@ -347,6 +356,12 @@ func (g *Gateway) Start() error {
 						g.log.Err(err).Msg("dht update failed")
 						after = 10 * time.Second
 						continue
+					}
+
+					if g.allowClearnet {
+						if err := g.updateClearnetDHT(g.closerCtx, 3600); err != nil {
+							g.log.Warn().Err(err).Msg("failed to update clearnet DHT")
+						}
 					}
 
 					g.log.Debug().Msg("dht updated")
@@ -681,6 +696,12 @@ func (s *Section) closeIfNotLocked() bool {
 	if s.out != nil {
 		s.log.Debug().Msg("closing out port")
 		s.out.Close()
+		s.out = nil
+	}
+	if s.tcpOut != nil {
+		s.log.Debug().Msg("closing tcp out")
+		s.tcpOut.Close()
+		s.tcpOut = nil
 	}
 	s.log.Debug().Msg("section closed")
 

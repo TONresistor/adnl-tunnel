@@ -164,7 +164,7 @@ func RunTunnel(stopCtx context.Context, cfg *config.ClientConfig, sharedCfg *con
 
 	tGate := NewGateway(gate, dhtClient, tunKey, logger.With().Str("component", "gateway").Logger(), PaymentConfig{
 		Service: pay,
-	})
+	}, false)
 	go func() {
 		if err = tGate.Start(); err != nil {
 			events <- fmt.Errorf("tunnel gateway failed: %w", err)
@@ -259,9 +259,20 @@ reassemble:
 	}
 	rnd := rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(rndInt))))
 
-	rnd.Shuffle(len(nodes), func(i, j int) {
-		nodes[i], nodes[j] = nodes[j], nodes[i]
-	})
+	if ClearnetExitMode && len(nodes) > 1 {
+		// In clearnet exit mode, the last node in the pool is the exit node
+		// (placed there by the proxy). Pin it as "out" and shuffle only the rest.
+		out := nodes[len(nodes)-1]
+		rest := nodes[:len(nodes)-1]
+		rnd.Shuffle(len(rest), func(i, j int) {
+			rest[i], rest[j] = rest[j], rest[i]
+		})
+		nodes = append([]config.TunnelRouteSection{out}, rest...)
+	} else {
+		rnd.Shuffle(len(nodes), func(i, j int) {
+			nodes[i], nodes[j] = nodes[j], nodes[i]
+		})
+	}
 
 	out := nodes[0]
 	pool := nodes[1:]

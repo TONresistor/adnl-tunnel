@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	cRand "crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -71,6 +72,13 @@ type SectionInfo struct {
 	PaymentInfo *Payer
 }
 
+// ClearnetExitMode enables clearnet TCP exit when creating RegularOutTunnel.
+var ClearnetExitMode bool
+
+// OnTCPPayload is called when a TCP payload (TCPOutBindDonePayload, TCPConnectedPayload,
+// TCPDataPayload, TCPCloseResponsePayload) arrives through the tunnel.
+var OnTCPPayload func(payload tl.Serializable)
+
 type RegularOutTunnel struct {
 	localID           uint32
 	gateway           *Gateway
@@ -78,6 +86,7 @@ type RegularOutTunnel struct {
 	usePayments       bool
 	paymentsConfirmed int32
 	wantDestroy       int32
+	clearnetExit      bool
 
 	tunnelState       uint32
 	sendControlSignal chan struct{}
@@ -160,6 +169,7 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		chainTo:            chainTo,
 		chainFrom:          chainFrom,
 		payloadKeys:        pec,
+		clearnetExit:       ClearnetExitMode,
 		sendControlSignal:  make(chan struct{}, 1),
 		read:               make(chan DeliverUDPPayload, 512*1024),
 		localAddr:          net.UDPAddrFromAddrPort(ap),
@@ -621,6 +631,19 @@ func (t *RegularOutTunnel) reassembleInstructions(msg *EncryptedMessage) (*Encry
 				v.InboundInstructions = inMsg.Instructions
 
 				container.List[y] = v
+			case *BindTCPOutInstruction:
+				inMsg := &EncryptedMessage{
+					SectionPubKey: v.InboundSectionPubKey,
+					Instructions:  v.InboundInstructions,
+				}
+
+				inMsg, err = t.reassembleInstructions(inMsg)
+				if err != nil {
+					return nil, fmt.Errorf("reassemble tcp instructions failed: %v", err)
+				}
+				v.InboundInstructions = inMsg.Instructions
+
+				container.List[y] = v
 			}
 		}
 
@@ -942,30 +965,58 @@ func (t *RegularOutTunnel) prepareInitMessage(state uint32) (*EncryptedMessage, 
 					price = t.chainTo[i].PaymentInfo.PricePerPacket
 				}
 
-				if err = t.chainTo[i].Keys.EncryptInstructionsMessage(msg, BuildRouteInstruction{ // we build route here to route system messages, like tunnel payments
+				var bindInstruction tl.Serializable
+				var cacheInstruction tl.Serializable
+				if t.clearnetExit {
+					bindInstruction = BindTCPOutInstruction{
+						InboundNodeADNL:      id,
+						InboundSectionPubKey: backMsg.SectionPubKey,
+						InboundInstructions:  backMsg.Instructions,
+						ReceiverPubKey:       t.payloadKeys.SectionPubKey,
+						PricePerPacket:       price,
+					}
+					cacheInstruction = CacheInstruction{
+						Version:      uint64(time.Now().UnixNano()),
+						Instructions: []any{SendTCPOutInstruction{}},
+					}
+				} else {
+					bindInstruction = BindOutInstruction{
+						InboundNodeADNL:      id,
+						InboundSectionPubKey: backMsg.SectionPubKey,
+						InboundInstructions:  backMsg.Instructions,
+						ReceiverPubKey:       t.payloadKeys.SectionPubKey,
+						PricePerPacket:       price,
+					}
+					cacheInstruction = CacheInstruction{
+						Version:      uint64(time.Now().UnixNano()),
+						Instructions: []any{SendOutInstruction{}},
+					}
+				}
+
+				if err = t.chainTo[i].Keys.EncryptInstructionsMessage(msg, BuildRouteInstruction{
 					TargetADNL:          id,
 					TargetSectionPubKey: backMsg.SectionPubKey,
 					RouteID:             ^binary.LittleEndian.Uint32(backMsg.SectionPubKey),
-					PricePerPacket:      price, // we assign price, but free rate is enough for us here, we will not pay actually
-				}, BindOutInstruction{
-					InboundNodeADNL:      id,
-					InboundSectionPubKey: backMsg.SectionPubKey,
-					InboundInstructions:  backMsg.Instructions,
-					ReceiverPubKey:       t.payloadKeys.SectionPubKey,
-					PricePerPacket:       price,
-				}, CacheInstruction{
-					Version:      uint64(time.Now().UnixNano()),
-					Instructions: []any{SendOutInstruction{}},
-				}); err != nil {
+					PricePerPacket:      price,
+				}, bindInstruction, cacheInstruction); err != nil {
 					return nil, fmt.Errorf("encrypt bind out failed: %w", err)
 				}
 				continue
 			}
 
-			if err := t.chainTo[i].Keys.EncryptInstructionsMessage(msg, CacheInstruction{
-				Version:      uint64(time.Now().UnixNano()),
-				Instructions: []any{SendOutInstruction{}},
-			}); err != nil {
+			var sendCacheInstruction tl.Serializable
+			if t.clearnetExit {
+				sendCacheInstruction = CacheInstruction{
+					Version:      uint64(time.Now().UnixNano()),
+					Instructions: []any{SendTCPOutInstruction{}},
+				}
+			} else {
+				sendCacheInstruction = CacheInstruction{
+					Version:      uint64(time.Now().UnixNano()),
+					Instructions: []any{SendOutInstruction{}},
+				}
+			}
+			if err := t.chainTo[i].Keys.EncryptInstructionsMessage(msg, sendCacheInstruction); err != nil {
 				return nil, fmt.Errorf("encrypt send out failed: %w", err)
 			}
 
@@ -1015,8 +1066,6 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 					return fmt.Errorf("send init message failed: %w", err)
 				}
 			case StateTypeOptimizingRoutes:
-				atomic.StoreUint32(&t.tunnelState, StateTypeOptimized)
-
 				if atomic.CompareAndSwapUint32(&t.tunnelState, StateTypeOptimizingRoutes, StateTypeOptimized) {
 					t.log.Info().Msg("route optimized, ready to use")
 					t.requestControlMessage()
@@ -1090,6 +1139,26 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 
 			t.log.Info().Str("ip", net.IP(p.IP).String()).Uint32("port", p.Port).Msg("out gateway updated")
 
+			return nil
+		case TCPOutBindDonePayload:
+			if f := OnTCPPayload; f != nil {
+				f(p)
+			}
+			return nil
+		case TCPConnectedPayload:
+			if f := OnTCPPayload; f != nil {
+				f(p)
+			}
+			return nil
+		case TCPDataPayload:
+			if f := OnTCPPayload; f != nil {
+				f(p)
+			}
+			return nil
+		case TCPCloseResponsePayload:
+			if f := OnTCPPayload; f != nil {
+				f(p)
+			}
 			return nil
 		default:
 			return fmt.Errorf("incorrect payload type: %T", p)
@@ -1258,6 +1327,48 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	atomic.AddUint64(&t.packetsSent, 1)
 
 	return len(p), nil
+}
+
+// WriteTCPPayload sends a TL-serialized TCP payload (TCPConnectPayload, TCPDataPayload,
+// TCPClosePayload) through the tunnel to the exit node.
+func (t *RegularOutTunnel) WriteTCPPayload(obj tl.Serializable) error {
+	state := atomic.LoadUint32(&t.tunnelState)
+	if state < StateTypeOptimized {
+		return fmt.Errorf("tunnel is not ready for sending")
+	}
+
+	if atomic.LoadInt32(&t.wantDestroy) != 0 {
+		return fmt.Errorf("tunnel is destroyed")
+	}
+
+	payload, err := tl.Serialize(obj, true)
+	if err != nil {
+		return fmt.Errorf("tcp payload serialization error: %w", err)
+	}
+
+	// Pad to fixed cell size for traffic analysis resistance (tcpCellSize is in tcp_out.go)
+	if len(payload) < tcpCellSize {
+		padded := make([]byte, tcpCellSize)
+		copy(padded, payload)
+		cRand.Read(padded[len(payload):])
+		payload = padded
+	}
+
+	payload, err = t.payloadKeys.EncryptPayload(payload)
+	if err != nil {
+		return fmt.Errorf("encrypt tcp payload error: %w", err)
+	}
+
+	if err = t.peer.SendCustomMessage(context.Background(), EncryptedMessageCached{
+		SectionPubKey: t.chainTo[0].Keys.SectionPubKey,
+		Seqno:         atomic.AddUint32(&t.seqnoForward, 1),
+		Payload:       payload,
+	}); err != nil {
+		return fmt.Errorf("send tcp payload error: %w", err)
+	}
+	atomic.AddUint64(&t.packetsSent, 1)
+
+	return nil
 }
 
 func (t *RegularOutTunnel) Close() error {

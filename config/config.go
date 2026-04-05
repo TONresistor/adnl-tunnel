@@ -36,6 +36,10 @@ type Config struct {
 	ExternalIP       string
 	PaymentsEnabled  bool
 	Payments         PaymentsConfig
+
+	AllowClearnetExit     bool  `json:"AllowClearnetExit,omitempty"`
+	ClearnetExitPorts     []int `json:"ClearnetExitPorts,omitempty"`
+	MaxTCPConnsPerSection int   `json:"MaxTCPConnsPerSection,omitempty"`
 }
 
 type PaymentChain struct {
@@ -270,6 +274,8 @@ func LoadConfig(path string) (*Config, error) {
 					MinSafeVirtualChannelTimeoutSec: 300,
 				},
 			},
+			ClearnetExitPorts:     []int{443},
+			MaxTCPConnsPerSection: 64,
 		}
 
 		ip, seed := checkCanSeed()

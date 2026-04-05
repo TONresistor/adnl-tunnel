@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"github.com/xssnick/tonutils-go/tl"
 	"net"
 	"sync/atomic"
 	"time"
@@ -29,6 +30,10 @@ func (a *AtomicSwitchableRegularTunnel) ReadFrom(p []byte) (n int, addr net.Addr
 
 func (a *AtomicSwitchableRegularTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	return a.resolve().WriteTo(p, addr)
+}
+
+func (a *AtomicSwitchableRegularTunnel) WriteTCPPayload(obj tl.Serializable) error {
+	return a.resolve().WriteTCPPayload(obj)
 }
 
 func (a *AtomicSwitchableRegularTunnel) Close() error {
