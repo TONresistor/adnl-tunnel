@@ -204,7 +204,7 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 		off, num := 0, 0
 		buf := make([]byte, (16+2+adnl.MaxMTU)*100)
 		sinceLastBatch := time.Now()
-		ctx, _ := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		ctx, ctxCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 
 		for {
 			tun := (*tunnel.RegularOutTunnel)(atomic.LoadPointer(&indexMatch[0]))
@@ -217,7 +217,8 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 				}
 				// we reinit it when done to not create it for each packet read
 				// we need it to not lock batch for long time when there is no packets
-				ctx, _ = context.WithTimeout(context.Background(), 20*time.Millisecond)
+				ctxCancel()
+				ctx, ctxCancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
 			}
 
 			if n > adnl.MaxMTU {
