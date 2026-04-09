@@ -34,6 +34,8 @@ var (
 	opTCPConnect uint32
 	opTCPData    uint32
 	opTCPClose   uint32
+	opTCPAck     uint32
+	opSendMe     uint32
 )
 
 func init() {
@@ -69,6 +71,11 @@ func init() {
 
 	instructionOpcodes[tl.Register(BindTCPOutInstruction{}, "adnlTunnel.bindTCPOutInstruction inboundNodeADNL:int256 inboundSectionPubKey:int256 inboundInstructions:bytes receiverPubKey:int256 = adnlTunnel.Instruction")] = reflect.TypeOf(BindTCPOutInstruction{})
 	instructionOpcodes[tl.Register(SendTCPOutInstruction{}, "adnlTunnel.sendTCPOutInstruction = adnlTunnel.Instruction")] = reflect.TypeOf(SendTCPOutInstruction{})
+
+	// Reliable transport: ACK, NACK, flow control
+	opTCPAck = tl.Register(TCPAckPayload{}, "adnlTunnel.tcpAckPayload connId:int ackSeqno:long ackBitmap:long = adnlTunnel.TCPAckPayload")
+	opSendMe = tl.Register(SendMePayload{}, "adnlTunnel.sendMePayload connId:int credit:int = adnlTunnel.SendMePayload")
+	tl.Register(SectionNACKPayload{}, "adnlTunnel.sectionNACKPayload sectionKey:int256 missingSeqnos:(vector int) = adnlTunnel.SectionNACKPayload")
 }
 
 type PingMeta struct {
@@ -94,12 +101,27 @@ type InstructionsContainer struct {
 	List  []tl.Serializable // can be any instruction, for example RouteInstruction + PaymentInstruction
 } // min overhead size: 4 + 4 + (instructions count)*4 bytes
 
+// maxInstructionsPerContainer caps the number of instructions a single
+// InstructionsContainer may carry, as a DoS guard before allocation.
+// 256 is generous: legitimate containers typically hold a handful of
+// instructions (route + payment + maybe report stats).
+const maxInstructionsPerContainer = 256
+
 // Parse implemented manually for optimization
 func (c *InstructionsContainer) Parse(data []byte) ([]byte, error) {
+	if len(data) < 8 {
+		return nil, fmt.Errorf("instructions container too short")
+	}
 	c.Seqno = binary.LittleEndian.Uint32(data)
 
 	num := int(binary.LittleEndian.Uint32(data[4:]))
 	data = data[8:]
+
+	// Defensive cap: reject obviously corrupted or adversarial counts
+	// before the parse loop allocates per-instruction memory.
+	if num < 0 || num > maxInstructionsPerContainer {
+		return nil, fmt.Errorf("instructions container claims %d entries, max %d", num, maxInstructionsPerContainer)
+	}
 
 	for i := 0; i < num; i++ {
 		if len(data) < 4 {
@@ -172,8 +194,16 @@ func (ins *CacheInstruction) Parse(data []byte) ([]byte, error) {
 
 	ins.Version = binary.LittleEndian.Uint64(data)
 
+	if len(data) < 12 {
+		return nil, fmt.Errorf("cache instruction too short for vector length")
+	}
 	num := int(binary.LittleEndian.Uint32(data[8:]))
 	data = data[12:]
+
+	// Defensive cap: same threshold as InstructionsContainer.
+	if num < 0 || num > maxInstructionsPerContainer {
+		return nil, fmt.Errorf("cache instruction claims %d entries, max %d", num, maxInstructionsPerContainer)
+	}
 
 	for i := 0; i < num; i++ {
 		if len(data) < 4 {
@@ -774,11 +804,9 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		go s.out.Listen(8)
 
 		port = uint16(s.out.conn.LocalAddr().(*net.UDPAddr).Port)
-		s.log.Info().
-			Str("back_addr", s.out.inboundPeer.getAddr()).
-			Uint16("alloc_port", port).
-			Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
-			Msg("out addr allocated")
+		// Privacy: do not log upstream peer address or ADNL ID. Operators
+		// should not retain a record linking sessions to neighbours.
+		s.log.Debug().Uint16("alloc_port", port).Msg("out addr allocated")
 	} else {
 		s.out.mx.Lock()
 		inADNLChanged := !bytes.Equal(s.out.InboundADNL, ins.InboundNodeADNL)
@@ -803,13 +831,8 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			s.out.Instructions = ins.InboundInstructions
 			s.out.PricePerPacket = new(big.Int).SetUint64(ins.PricePerPacket)
 
-			s.log.Info().
-				Str("back_addr", s.out.inboundPeer.getAddr()).
-				Uint16("port", port).
-				Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
-				Int("size", len(ins.InboundInstructions)).
-				Uint64("crc", crc64.Checksum(ins.InboundInstructions, crcTable)).
-				Msg("out addr reconfigured")
+			// Privacy: do not log upstream peer address or ADNL ID.
+			s.log.Debug().Uint16("port", port).Msg("out addr reconfigured")
 		}
 		s.out.mx.Unlock()
 
@@ -879,15 +902,17 @@ func (ins BindTCPOutInstruction) Execute(ctx context.Context, s *Section, msg *E
 			portPolicy:          s.gw.clearnetPorts,
 			ipBlacklist:         s.gw.clearnetBlacklist,
 			PricePerChunk:       new(big.Int).SetUint64(ins.PricePerPacket),
-			log:                 s.log.With().Str("component", "tcp_out").Logger(),
+			// Privacy: tcp_out logger does NOT inherit the section logger's
+			// from_addr / from_adnl context. Use the gateway's bare logger
+			// so per-connection logs cannot be linked to upstream peers.
+			log: s.gw.log.With().Str("component", "tcp_out").Logger(),
 		}
 
 		s.tcpOut.inboundPeer.AddReference()
+		go s.tcpOut.retransmitLoop()
 
-		s.log.Info().
-			Str("back_addr", s.tcpOut.inboundPeer.getAddr()).
-			Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
-			Msg("tcp out allocated")
+		// Privacy: do not log upstream peer address or ADNL ID.
+		s.log.Debug().Msg("tcp out allocated")
 	} else {
 		s.tcpOut.mx.Lock()
 		inADNLChanged := !bytes.Equal(s.tcpOut.InboundADNL, ins.InboundNodeADNL)
@@ -912,10 +937,8 @@ func (ins BindTCPOutInstruction) Execute(ctx context.Context, s *Section, msg *E
 			s.tcpOut.Instructions = ins.InboundInstructions
 			s.tcpOut.PricePerChunk = new(big.Int).SetUint64(ins.PricePerPacket)
 
-			s.log.Info().
-				Str("back_addr", s.tcpOut.inboundPeer.getAddr()).
-				Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
-				Msg("tcp out reconfigured")
+			// Privacy: do not log upstream peer address or ADNL ID.
+			s.log.Debug().Msg("tcp out reconfigured")
 		}
 		s.tcpOut.mx.Unlock()
 	}
@@ -964,7 +987,6 @@ func (ins ReportStatsInstruction) Execute(ctx context.Context, s *Section, msg *
 		return fmt.Errorf("instruction is not executable since routing is not allowed")
 	}
 
-	println(reflect.TypeOf(ins).String())
 	return nil
 }
 
@@ -992,7 +1014,6 @@ func (ins SendOutInstruction) Execute(ctx context.Context, s *Section, msg *Encr
 type DeliverInstruction struct{}
 
 func (ins DeliverInstruction) Execute(ctx context.Context, s *Section, msg *EncryptedMessage, restInstructions []byte) error {
-	println(reflect.TypeOf(ins).String())
 	return nil
 }
 
@@ -1093,6 +1114,64 @@ type TCPCloseResponsePayload struct {
 	Seqno  uint64 `tl:"long"`
 	ConnId uint32 `tl:"int"`
 	Reason uint32 `tl:"int"`
+}
+
+type TCPAckPayload struct {
+	ConnId    uint32 `tl:"int"`
+	AckSeqno  uint64 `tl:"long"`
+	AckBitmap uint64 `tl:"long"`
+}
+
+type SendMePayload struct {
+	ConnId uint32 `tl:"int"`
+	Credit uint32 `tl:"int"`
+}
+
+// maxNACKSeqnos is the hard cap on the number of missing seqnos a single
+// SectionNACKPayload may carry. It bounds both the wire size and the amount
+// of work a relay performs in response.
+const maxNACKSeqnos = 16
+
+type SectionNACKPayload struct {
+	SectionKey    []byte   `tl:"int256"`
+	MissingSeqnos []uint32 `tl:"vector int"`
+}
+
+// Parse implements tl.ParseableTL with strict bounds checking. The default
+// reflection-based vector parser in tonutils-go calls MakeSlice(ln, ln)
+// without validating that ln is consistent with the remaining buffer size,
+// which allows a 40-byte packet with ln=0xFFFFFFFF to force a ~16 GB
+// allocation. This custom Parse validates the vector length against both
+// a protocol-level cap (maxNACKSeqnos) AND the remaining buffer size before
+// allocating, closing the OOM vector.
+func (p *SectionNACKPayload) Parse(data []byte) ([]byte, error) {
+	if len(data) < 32 {
+		return nil, fmt.Errorf("section nack payload too short for section key")
+	}
+	p.SectionKey = make([]byte, 32)
+	copy(p.SectionKey, data[:32])
+	data = data[32:]
+
+	if len(data) < 4 {
+		return nil, fmt.Errorf("section nack payload missing vector length")
+	}
+	ln := binary.LittleEndian.Uint32(data)
+	data = data[4:]
+
+	if ln > maxNACKSeqnos {
+		return nil, fmt.Errorf("section nack payload claims %d seqnos, max %d", ln, maxNACKSeqnos)
+	}
+	// Guard against (ln * 4) overflow and against ln exceeding the buffer.
+	needed := uint64(ln) * 4
+	if uint64(len(data)) < needed {
+		return nil, fmt.Errorf("section nack payload truncated: need %d bytes for %d seqnos, have %d", needed, ln, len(data))
+	}
+
+	p.MissingSeqnos = make([]uint32, ln)
+	for i := uint32(0); i < ln; i++ {
+		p.MissingSeqnos[i] = binary.LittleEndian.Uint32(data[i*4 : i*4+4])
+	}
+	return data[needed:], nil
 }
 
 func (o *Out) Close() {

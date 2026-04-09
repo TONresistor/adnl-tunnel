@@ -164,7 +164,7 @@ func RunTunnel(stopCtx context.Context, cfg *config.ClientConfig, sharedCfg *con
 
 	tGate := NewGateway(gate, dhtClient, tunKey, logger.With().Str("component", "gateway").Logger(), PaymentConfig{
 		Service: pay,
-	}, false)
+	}, false, nil, 0)
 	go func() {
 		if err = tGate.Start(); err != nil {
 			events <- fmt.Errorf("tunnel gateway failed: %w", err)
@@ -503,7 +503,7 @@ func checkAndDeployPaymentChannels(ctx context.Context, apiClient ton.APIClientW
 		}
 
 		if len(sec.Payment.Chain) == 0 {
-			return fmt.Errorf("no payment nodes chain specified in config for node " + base64.StdEncoding.EncodeToString(sec.Key))
+			return fmt.Errorf("no payment nodes chain specified in config for node %s", base64.StdEncoding.EncodeToString(sec.Key))
 		}
 
 		if sec.Payment != nil {

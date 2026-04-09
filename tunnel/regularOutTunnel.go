@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	cRand "crypto/rand"
+	"math/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -79,6 +79,19 @@ var ClearnetExitMode bool
 // TCPDataPayload, TCPCloseResponsePayload) arrives through the tunnel.
 var OnTCPPayload func(payload tl.Serializable)
 
+// tcpRecvTracker tracks received seqnos for a single TCP connection (receiver side).
+// Used to build selective ACKs sent back to the exit node.
+type tcpRecvTracker struct {
+	started       bool          // false until first packet observed
+	ackSeqno      uint64        // highest contiguous seqno received
+	bitmap        uint64        // SACK bitmap for seqno > ackSeqno
+	cellsSinceAck int           // cells received since last ACK sent
+	credits       *CreditWindow // flow control: tracks deliveries, triggers SendMe
+}
+
+// ackThreshold is the number of cells to receive before sending an ACK.
+const ackThreshold = 3
+
 type RegularOutTunnel struct {
 	localID           uint32
 	gateway           *Gateway
@@ -98,6 +111,20 @@ type RegularOutTunnel struct {
 	chainTo     []*SectionInfo
 	chainFrom   []*SectionInfo
 	payloadKeys *EncryptionKeys
+
+	// Receiver-side ACK tracking (per TCP connection)
+	recvTrackers map[uint32]*tcpRecvTracker
+	recvMu       sync.Mutex
+
+	// Sender-side credit windows (per TCP connection, for client→exit flow control)
+	sendCredits   map[uint32]*CreditWindow
+	sendCreditsMu sync.Mutex
+
+	// ackCh is drained by a single dedicated goroutine (ackWorker) so that
+	// per-event ACK / SendMe sends never spawn unbounded goroutines. The
+	// channel is non-blocking from the producer side: a full queue means a
+	// later cumulative ACK will catch up — losing one is harmless.
+	ackCh chan tl.Serializable
 
 	read chan DeliverUDPPayload
 
@@ -179,8 +206,12 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		close:              closer,
 		packetsToPrepay:    ChannelPacketsToPrepay,
 		lastFullyCheckedAt: time.Now().Unix(),
+		recvTrackers:       make(map[uint32]*tcpRecvTracker),
+		sendCredits:        make(map[uint32]*CreditWindow),
+		ackCh:              make(chan tl.Serializable, 64),
 	}
 	rt.peer.AddReference()
+	go rt.ackWorker()
 
 	list := append([]*SectionInfo{}, chainTo...)
 	list = append(list, chainFrom...)
@@ -1151,11 +1182,49 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 			}
 			return nil
 		case TCPDataPayload:
+			// Track received seqno for selective ACK
+			t.trackRecvSeqno(p.ConnId, p.Seqno)
+
 			if f := OnTCPPayload; f != nil {
 				f(p)
 			}
+
+			// Record delivery for flow control; enqueue SendMe when threshold reached.
+			// Routed through the ackWorker queue to bound concurrent sends.
+			tracker := t.getOrCreateRecvTracker(p.ConnId)
+			if shouldSend, amount := tracker.credits.RecordDelivery(); shouldSend {
+				t.enqueueAck(SendMePayload{ConnId: p.ConnId, Credit: uint32(amount)})
+			}
+			return nil
+		case TCPAckPayload:
+			// ACK from exit node acknowledging data this client sent.
+			// Client-side upstream buffering is not wired in clearnet mode
+			// (client sends small requests that fit in one cell), so ACKs
+			// for upstream data are informational only and discarded here.
+			return nil
+		case SendMePayload:
+			// Flow control: exit node is granting credits for client→exit direction.
+			// Bounds-check the wire value before casting uint32 → int32 to prevent
+			// a malicious peer from draining credits with Credit > 2^31.
+			cw := t.getSendCredits(p.ConnId)
+			if cw != nil {
+				maxGrant := cw.MaxCreditGrant()
+				if p.Credit > 0 && p.Credit <= uint32(maxGrant) {
+					cw.GrantCredits(int32(p.Credit))
+				}
+			}
 			return nil
 		case TCPCloseResponsePayload:
+			// Clean up recv tracker for closed connection
+			t.recvMu.Lock()
+			delete(t.recvTrackers, p.ConnId)
+			t.recvMu.Unlock()
+
+			// Clean up send credits for closed connection
+			t.sendCreditsMu.Lock()
+			delete(t.sendCredits, p.ConnId)
+			t.sendCreditsMu.Unlock()
+
 			if f := OnTCPPayload; f != nil {
 				f(p)
 			}
@@ -1331,7 +1400,34 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 // WriteTCPPayload sends a TL-serialized TCP payload (TCPConnectPayload, TCPDataPayload,
 // TCPClosePayload) through the tunnel to the exit node.
+//
+// For TCPDataPayload with Data larger than maxTCPDataPerCell, the payload is
+// automatically chunked into multiple fixed-size cells. This guarantees that
+// every cell on the wire is exactly tcpCellSize bytes after padding,
+// regardless of how much data the caller passes (Tor-style traffic analysis
+// resistance).
 func (t *RegularOutTunnel) WriteTCPPayload(obj tl.Serializable) error {
+	// Auto-chunk oversized TCPDataPayload before any other processing.
+	if dp, ok := obj.(TCPDataPayload); ok && len(dp.Data) > maxTCPDataPerCell {
+		for off := 0; off < len(dp.Data); off += maxTCPDataPerCell {
+			end := off + maxTCPDataPerCell
+			isLast := end >= len(dp.Data)
+			if end > len(dp.Data) {
+				end = len(dp.Data)
+			}
+			chunk := TCPDataPayload{
+				ConnId: dp.ConnId,
+				Data:   dp.Data[off:end],
+				// Carry FIN only on the final chunk.
+				Fin: isLast && dp.Fin,
+			}
+			if err := t.WriteTCPPayload(chunk); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	state := atomic.LoadUint32(&t.tunnelState)
 	if state < StateTypeOptimized {
 		return fmt.Errorf("tunnel is not ready for sending")
@@ -1341,6 +1437,16 @@ func (t *RegularOutTunnel) WriteTCPPayload(obj tl.Serializable) error {
 		return fmt.Errorf("tunnel is destroyed")
 	}
 
+	// Flow control: only gate TCPDataPayload (control messages bypass credits)
+	if dp, ok := obj.(TCPDataPayload); ok {
+		cw := t.getOrCreateSendCredits(dp.ConnId)
+		for !cw.Consume() {
+			if err := cw.WaitForCredit(t.closerCtx); err != nil {
+				return fmt.Errorf("flow control wait cancelled: %w", err)
+			}
+		}
+	}
+
 	payload, err := tl.Serialize(obj, true)
 	if err != nil {
 		return fmt.Errorf("tcp payload serialization error: %w", err)
@@ -1348,10 +1454,13 @@ func (t *RegularOutTunnel) WriteTCPPayload(obj tl.Serializable) error {
 
 	// Pad to fixed cell size for traffic analysis resistance (tcpCellSize is in tcp_out.go)
 	if len(payload) < tcpCellSize {
-		padded := make([]byte, tcpCellSize)
+		padded := tcpCellPool.Get().([]byte)
 		copy(padded, payload)
-		cRand.Read(padded[len(payload):])
+		for i := len(payload); i < tcpCellSize; i++ {
+			padded[i] = byte(rand.Uint32())
+		}
 		payload = padded
+		defer tcpCellPool.Put(padded)
 	}
 
 	payload, err = t.payloadKeys.EncryptPayload(payload)
@@ -1369,6 +1478,134 @@ func (t *RegularOutTunnel) WriteTCPPayload(obj tl.Serializable) error {
 	atomic.AddUint64(&t.packetsSent, 1)
 
 	return nil
+}
+
+// trackRecvSeqno updates the receiver-side tracker for incoming TCPDataPayload
+// and sends an ACK when enough cells have accumulated or a gap is detected.
+func (t *RegularOutTunnel) trackRecvSeqno(connId uint32, seqno uint64) {
+	t.recvMu.Lock()
+	defer t.recvMu.Unlock()
+
+	tracker := t.recvTrackers[connId]
+	if tracker == nil {
+		tracker = &tcpRecvTracker{credits: NewCreditWindow()}
+		t.recvTrackers[connId] = tracker
+	}
+
+	// First packet ever for this connection: set the baseline and return.
+	// No ACK is sent yet — we wait for ackThreshold cells or a gap.
+	if !tracker.started {
+		tracker.started = true
+		tracker.ackSeqno = seqno
+		tracker.cellsSinceAck = 1
+		return
+	}
+
+	hasGap := false
+
+	switch {
+	case seqno == tracker.ackSeqno+1:
+		// Next contiguous seqno — advance ackSeqno.
+		tracker.ackSeqno = seqno
+		// Collapse bitmap: while bit 0 is set, ackSeqno+1 was already received.
+		for tracker.bitmap&1 != 0 {
+			tracker.ackSeqno++
+			tracker.bitmap >>= 1
+		}
+	case seqno > tracker.ackSeqno+1:
+		// Out-of-order ahead: set bit in bitmap (cap at 64-packet window).
+		offset := seqno - tracker.ackSeqno - 1
+		if offset < 64 {
+			tracker.bitmap |= 1 << offset
+		}
+		// If the gap exceeds our bitmap window, the packet is still
+		// sent-acked on the next cumulative advance; the sender's RTO
+		// timer will recover anything that falls outside the window.
+		hasGap = true
+	default:
+		// seqno <= tracker.ackSeqno: duplicate or old, ignore.
+		return
+	}
+
+	tracker.cellsSinceAck++
+
+	// Send ACK every ackThreshold cells or immediately on gap detection.
+	if tracker.cellsSinceAck >= ackThreshold || hasGap {
+		t.sendTCPAckLocked(connId, tracker)
+	}
+}
+
+// sendTCPAckLocked enqueues a TCPAckPayload onto the ack worker queue.
+// Must be called with recvMu held. The actual network send happens on
+// the ackWorker goroutine, decoupling the lock from I/O.
+//
+// If the queue is full, the ACK is dropped: the next ACK will carry a
+// more advanced cumulative ackSeqno and the receiver will catch up.
+func (t *RegularOutTunnel) sendTCPAckLocked(connId uint32, tracker *tcpRecvTracker) {
+	tracker.cellsSinceAck = 0
+	ack := TCPAckPayload{
+		ConnId:    connId,
+		AckSeqno:  tracker.ackSeqno,
+		AckBitmap: tracker.bitmap,
+	}
+	t.enqueueAck(ack)
+}
+
+// enqueueAck performs a non-blocking send onto the ackCh queue.
+// Used for both TCPAckPayload and SendMePayload.
+func (t *RegularOutTunnel) enqueueAck(payload tl.Serializable) {
+	select {
+	case t.ackCh <- payload:
+	default:
+		t.log.Trace().Msg("ack queue full, dropping (next ack will catch up)")
+	}
+}
+
+// ackWorker is the single goroutine that drains ackCh and sends ACK /
+// SendMe messages. It exits when the tunnel context is cancelled.
+func (t *RegularOutTunnel) ackWorker() {
+	for {
+		select {
+		case <-t.closerCtx.Done():
+			return
+		case payload := <-t.ackCh:
+			if err := t.WriteTCPPayload(payload); err != nil {
+				t.log.Trace().Err(err).Msg("ack worker send failed")
+			}
+		}
+	}
+}
+
+// getOrCreateRecvTracker returns the recv tracker for the given connection,
+// creating one if it doesn't exist. Thread-safe.
+func (t *RegularOutTunnel) getOrCreateRecvTracker(connId uint32) *tcpRecvTracker {
+	t.recvMu.Lock()
+	defer t.recvMu.Unlock()
+	tracker := t.recvTrackers[connId]
+	if tracker == nil {
+		tracker = &tcpRecvTracker{credits: NewCreditWindow()}
+		t.recvTrackers[connId] = tracker
+	}
+	return tracker
+}
+
+// getSendCredits returns the send-direction credit window for a connection, or nil.
+func (t *RegularOutTunnel) getSendCredits(connId uint32) *CreditWindow {
+	t.sendCreditsMu.Lock()
+	defer t.sendCreditsMu.Unlock()
+	return t.sendCredits[connId]
+}
+
+// getOrCreateSendCredits returns the send-direction credit window, creating if needed.
+func (t *RegularOutTunnel) getOrCreateSendCredits(connId uint32) *CreditWindow {
+	t.sendCreditsMu.Lock()
+	defer t.sendCreditsMu.Unlock()
+	cw := t.sendCredits[connId]
+	if cw == nil {
+		cw = NewCreditWindow()
+		t.sendCredits[connId] = cw
+	}
+	return cw
 }
 
 func (t *RegularOutTunnel) Close() error {

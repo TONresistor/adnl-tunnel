@@ -65,11 +65,6 @@ var GitCommit = "dev"
 func main() {
 	flag.Parse()
 
-	// Enable ADNL debug logging to see handshake errors
-	adnl.Logger = func(v ...any) {
-		fmt.Println("ADNL:", fmt.Sprint(v...))
-	}
-
 	// logs rotation
 	var logWriters = []io.Writer{zerolog.NewConsoleWriter()}
 
@@ -253,7 +248,7 @@ func main() {
 	if *Verbosity >= 3 {
 		lvl = zerolog.DebugLevel
 	}
-	tGate := tunnel.NewGateway(gate, dhtClient, tunKey, log.With().Str("component", "gateway").Logger().Level(lvl), pmt, cfg.AllowClearnetExit)
+	tGate := tunnel.NewGateway(gate, dhtClient, tunKey, log.With().Str("component", "gateway").Logger().Level(lvl), pmt, cfg.AllowClearnetExit, cfg.ClearnetExitPorts, cfg.MaxTCPConnsPerSection)
 	go func() {
 		if err = tGate.Start(); err != nil {
 			log.Fatal().Err(err).Msg("tunnel gateway failed")

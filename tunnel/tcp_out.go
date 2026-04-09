@@ -2,11 +2,11 @@ package tunnel
 
 import (
 	"context"
-	cRand "crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math/big"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -15,6 +15,10 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/xssnick/tonutils-go/tl"
 )
+
+var tcpCellPool = sync.Pool{
+	New: func() any { return make([]byte, tcpCellSize) },
+}
 
 const (
 	tcpStateOpen       = int32(iota)
@@ -27,6 +31,8 @@ type tcpConn struct {
 	conn      net.Conn
 	state     int32  // atomic
 	sendSeqno uint64 // atomic, per-connection seqno for ordered delivery
+	sendBuf   *SendBuffer
+	credits   *CreditWindow // flow control: credits granted by receiver
 	ctx       context.Context
 	cancel    func()
 }
@@ -43,10 +49,11 @@ type TCPOut struct {
 	InboundSectionKey   []byte
 	Instructions        []byte
 
-	conns       map[uint32]*tcpConn
-	maxConns    int
-	portPolicy  map[int]bool
-	ipBlacklist []*net.IPNet
+	conns          map[uint32]*tcpConn
+	maxConns       int
+	inFlightConns  atomic.Int32
+	portPolicy     map[int]bool
+	ipBlacklist    []*net.IPNet
 
 	PricePerChunk *big.Int // reserved for future payment enforcement
 
@@ -104,16 +111,26 @@ func (t *TCPOut) sendBack(obj tl.Serializable, isPayload bool) error {
 	// TL header encodes the real data length, so the receiver parses
 	// correctly and ignores the padding after decryption.
 	if len(pl) < tcpCellSize {
-		padded := make([]byte, tcpCellSize)
+		padded := tcpCellPool.Get().([]byte)
 		copy(padded, pl)
-		cRand.Read(padded[len(pl):])
+		for i := len(pl); i < tcpCellSize; i++ {
+			padded[i] = byte(rand.Uint32())
+		}
 		pl = padded
+		defer tcpCellPool.Put(padded)
 	}
 
+	// Snapshot mutable fields under brief RLock, then release before
+	// encrypt + network send to avoid holding the lock during I/O.
 	t.mx.RLock()
-	defer t.mx.RUnlock()
+	cipherKeyCRC := t.PayloadCipherKeyCRC
+	cipherKey := t.PayloadCipherKey
+	sectionKey := t.InboundSectionKey
+	instructions := t.Instructions
+	peer := t.inboundPeer
+	t.mx.RUnlock()
 
-	pl, err = encryptStream(t.PayloadCipherKeyCRC, t.PayloadCipherKey, pl)
+	pl, err = encryptStream(cipherKeyCRC, cipherKey, pl)
 	if err != nil {
 		return fmt.Errorf("encrypt payload failed: %w", err)
 	}
@@ -121,19 +138,19 @@ func (t *TCPOut) sendBack(obj tl.Serializable, isPayload bool) error {
 	var msg tl.Serializable
 	if isPayload {
 		msg = EncryptedMessageCached{
-			SectionPubKey: t.InboundSectionKey,
+			SectionPubKey: sectionKey,
 			Seqno:         atomic.AddUint32(&t.backSeqno, 1),
 			Payload:       pl,
 		}
 	} else {
 		msg = EncryptedMessage{
-			SectionPubKey: t.InboundSectionKey,
-			Instructions:  t.Instructions,
+			SectionPubKey: sectionKey,
+			Instructions:  instructions,
 			Payload:       pl,
 		}
 	}
 
-	if err = t.inboundPeer.SendCustomMessage(t.closer, msg); err != nil {
+	if err = peer.SendCustomMessage(t.closer, msg); err != nil {
 		return fmt.Errorf("send message to inbound tunnel failed: %w", err)
 	}
 	return nil
@@ -177,6 +194,19 @@ func (t *TCPOut) Send(payload []byte) error {
 			return fmt.Errorf("parse tcp close payload failed: %w", err)
 		}
 		t.HandleClose(p)
+	case opTCPAck:
+		var p TCPAckPayload
+		_, err = tl.Parse(&p, data, true)
+		if err != nil {
+			return fmt.Errorf("parse tcp ack failed: %w", err)
+		}
+		t.HandleAck(p)
+	case opSendMe:
+		var p SendMePayload
+		if _, err = tl.Parse(&p, data, true); err != nil {
+			return fmt.Errorf("parse sendme failed: %w", err)
+		}
+		t.HandleSendMe(p)
 	default:
 		return fmt.Errorf("unknown tcp payload opcode: %d", op)
 	}
@@ -185,13 +215,27 @@ func (t *TCPOut) Send(payload []byte) error {
 }
 
 func (t *TCPOut) HandleConnect(payload TCPConnectPayload) {
-	t.log.Debug().Uint32("connId", payload.ConnId).Str("host", string(payload.Host)).Uint32("port", payload.Port).Msg("tcp connect requested")
+	// Privacy: do NOT log the destination host. Exit operators must be able
+	// to truthfully claim "no logs of user activity". Only log the connection
+	// id at trace level for diagnostics.
+	t.log.Trace().Uint32("connId", payload.ConnId).Msg("tcp connect requested")
+
+	// Limit in-flight connect goroutines to prevent fan-out under load
+	if int(t.inFlightConns.Load()) >= t.maxConns {
+		if err := t.sendBack(TCPCloseResponsePayload{ConnId: payload.ConnId, Reason: TCPCloseLimit}, true); err != nil {
+			t.log.Trace().Err(err).Uint32("conn_id", payload.ConnId).Msg("send back close limit (in-flight) failed")
+		}
+		return
+	}
+	t.inFlightConns.Add(1)
 
 	// Run connect in a goroutine to avoid blocking message dispatch
 	go t.handleConnectAsync(payload)
 }
 
 func (t *TCPOut) handleConnectAsync(payload TCPConnectPayload) {
+	defer t.inFlightConns.Add(-1)
+
 	select {
 	case <-t.closer.Done():
 		return
@@ -225,7 +269,9 @@ func (t *TCPOut) handleConnectAsync(payload TCPConnectPayload) {
 	// DNS resolve and dial outside the lock — force IPv4
 	resolved, err := net.ResolveIPAddr("ip4", string(payload.Host))
 	if err != nil {
-		t.log.Debug().Err(err).Str("host", string(payload.Host)).Msg("dns resolve failed")
+		// Privacy: do NOT log the host on resolve failure. Just signal the
+		// failure category.
+		t.log.Trace().Uint32("conn_id", payload.ConnId).Msg("dns resolve failed")
 		if sendErr := t.sendBack(TCPCloseResponsePayload{ConnId: payload.ConnId, Reason: TCPCloseRefused}, true); sendErr != nil {
 			t.log.Trace().Err(sendErr).Uint32("conn_id", payload.ConnId).Msg("send back close refused failed")
 		}
@@ -233,7 +279,9 @@ func (t *TCPOut) handleConnectAsync(payload TCPConnectPayload) {
 	}
 
 	if t.isBlacklisted(resolved.IP) {
-		t.log.Debug().Str("ip", resolved.IP.String()).Msg("resolved IP is blacklisted")
+		// Privacy: do NOT log the resolved IP. Operators don't need to know
+		// which user-requested IP hit the blacklist; the metric is enough.
+		t.log.Trace().Uint32("conn_id", payload.ConnId).Msg("resolved IP is blacklisted")
 		if sendErr := t.sendBack(TCPCloseResponsePayload{ConnId: payload.ConnId, Reason: TCPClosePolicy}, true); sendErr != nil {
 			t.log.Trace().Err(sendErr).Uint32("conn_id", payload.ConnId).Msg("send back close policy (blacklist) failed")
 		}
@@ -258,14 +306,22 @@ func (t *TCPOut) handleConnectAsync(payload TCPConnectPayload) {
 
 	ctx, cancel := context.WithCancel(t.closer)
 	tc := &tcpConn{
-		id:     payload.ConnId,
-		conn:   conn,
-		state:  tcpStateOpen,
-		ctx:    ctx,
-		cancel: cancel,
+		id:      payload.ConnId,
+		conn:    conn,
+		state:   tcpStateOpen,
+		sendBuf: NewSendBuffer(320),
+		credits: NewCreditWindow(),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 
 	t.mx.Lock()
+	if t.conns == nil {
+		t.mx.Unlock()
+		cancel()
+		conn.Close()
+		return
+	}
 	// Re-check limit after dial
 	if len(t.conns) >= t.maxConns {
 		t.mx.Unlock()
@@ -307,6 +363,10 @@ func (t *TCPOut) HandleData(payload TCPDataPayload) {
 		return
 	}
 
+	if len(payload.Data) > 65535 {
+		return
+	}
+
 	if payload.Fin {
 		oldState := atomic.LoadInt32(&tc.state)
 		if oldState == tcpStateOpen {
@@ -344,6 +404,17 @@ func (t *TCPOut) HandleClose(payload TCPClosePayload) {
 	}
 }
 
+// maxTCPDataPerCell is the maximum number of TCP-stream bytes that can be
+// carried in a single TCPDataPayload while keeping the serialized cell at
+// or below tcpCellSize (1024 bytes). The TL framing of TCPDataPayload is:
+//
+//	opcode(4) + seqno(8) + connId(4) + bytes-len-prefix(4) + data(N) + pad(0..3) + Fin(4)
+//
+// = 24 + N + pad. To always fit in 1024, N must be ≤ 996 (with worst-case
+// 3-byte padding). We use 990 to leave a small safety margin in case the
+// TL framing ever changes.
+const maxTCPDataPerCell = 990
+
 func (t *TCPOut) readFromTCP(connId uint32) {
 	t.mx.RLock()
 	tc := t.conns[connId]
@@ -353,7 +424,7 @@ func (t *TCPOut) readFromTCP(connId uint32) {
 		return
 	}
 
-	buf := make([]byte, 1024)
+	buf := make([]byte, 16384) // match TLS record max size to minimize syscalls
 	for {
 		select {
 		case <-tc.ctx.Done():
@@ -364,20 +435,27 @@ func (t *TCPOut) readFromTCP(connId uint32) {
 		_ = tc.conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 		n, err := tc.conn.Read(buf)
 		if n > 0 {
-			data := make([]byte, n)
-			copy(data, buf[:n])
-			seqno := atomic.AddUint64(&tc.sendSeqno, 1)
-			if sendErr := t.sendBack(TCPDataPayload{Seqno: seqno, ConnId: connId, Data: data, Fin: false}, true); sendErr != nil {
-				t.log.Trace().Err(sendErr).Uint32("conn_id", connId).Msg("send back tcp data failed")
+			// Chunk the read into fixed-size cells. This is the canonical
+			// Tor-style traffic-analysis-resistance: every cell on the wire
+			// is exactly tcpCellSize bytes after padding, regardless of how
+			// much data the application read in one shot. A 16 KB TLS
+			// record becomes ~17 cells of 1024 bytes each.
+			data := buf[:n]
+			for offset := 0; offset < len(data); offset += maxTCPDataPerCell {
+				end := offset + maxTCPDataPerCell
+				if end > len(data) {
+					end = len(data)
+				}
+				if !t.sendTCPDataChunk(tc, connId, data[offset:end], false) {
+					// Connection closed during send (context cancelled).
+					return
+				}
 			}
 		}
 		if err != nil {
 			if err == io.EOF {
-				// Send FIN to client
-				finSeqno := atomic.AddUint64(&tc.sendSeqno, 1)
-				if sendErr := t.sendBack(TCPDataPayload{Seqno: finSeqno, ConnId: connId, Fin: true}, true); sendErr != nil {
-					t.log.Trace().Err(sendErr).Uint32("conn_id", connId).Msg("send back tcp fin failed")
-				}
+				// Send FIN as its own cell (no data, padded to tcpCellSize).
+				t.sendTCPDataChunk(tc, connId, nil, true)
 				oldState := atomic.LoadInt32(&tc.state)
 				if oldState == tcpStateOpen {
 					atomic.CompareAndSwapInt32(&tc.state, tcpStateOpen, tcpStateHalfClosed)
@@ -397,6 +475,173 @@ func (t *TCPOut) readFromTCP(connId uint32) {
 			delete(t.conns, connId)
 			t.mx.Unlock()
 			return
+		}
+	}
+}
+
+// sendTCPDataChunk emits a single TCPDataPayload cell containing at most
+// maxTCPDataPerCell bytes of TCP-stream data. The cell is gated by flow
+// control credits, buffered for retransmission, and sent through the
+// inbound tunnel.
+//
+// Returns false if the connection context was cancelled during the call.
+func (t *TCPOut) sendTCPDataChunk(tc *tcpConn, connId uint32, chunk []byte, fin bool) bool {
+	// Flow control: block until a credit is available.
+	for !tc.credits.Consume() {
+		if waitErr := tc.credits.WaitForCredit(tc.ctx); waitErr != nil {
+			return false
+		}
+	}
+
+	seqno := atomic.AddUint64(&tc.sendSeqno, 1)
+	payload := TCPDataPayload{Seqno: seqno, ConnId: connId, Data: chunk, Fin: fin}
+
+	padded, padErr := serializeAndPad(payload)
+	if padErr != nil {
+		t.log.Trace().Err(padErr).Uint32("conn_id", connId).Msg("serialize tcp data failed")
+		return true
+	}
+
+	if err := t.enqueueWithBackpressure(tc, padded); err != nil {
+		return false
+	}
+
+	if sendErr := t.sendBack(payload, true); sendErr != nil {
+		t.log.Trace().Err(sendErr).Uint32("conn_id", connId).Msg("send back tcp data failed")
+	}
+	return true
+}
+
+// enqueueWithBackpressure tries to store padded into tc.sendBuf, applying
+// backpressure by polling if the buffer is full. Returns nil on success,
+// or ctx.Err() if the connection context is cancelled while waiting.
+func (t *TCPOut) enqueueWithBackpressure(tc *tcpConn, padded []byte) error {
+	for {
+		if _, err := tc.sendBuf.Enqueue(padded); err == nil {
+			return nil
+		}
+		// Buffer full: wait for the retransmit loop or ACKs to free space.
+		select {
+		case <-tc.ctx.Done():
+			return tc.ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// sendBackRaw sends a pre-serialized, padded payload (before encryption).
+// Used for retransmitting buffered cells without re-serializing.
+func (t *TCPOut) sendBackRaw(padded []byte) error {
+	t.mx.RLock()
+	cipherKeyCRC := t.PayloadCipherKeyCRC
+	cipherKey := t.PayloadCipherKey
+	sectionKey := t.InboundSectionKey
+	peer := t.inboundPeer
+	t.mx.RUnlock()
+
+	pl, err := encryptStream(cipherKeyCRC, cipherKey, padded)
+	if err != nil {
+		return fmt.Errorf("encrypt payload failed: %w", err)
+	}
+
+	msg := EncryptedMessageCached{
+		SectionPubKey: sectionKey,
+		Seqno:         atomic.AddUint32(&t.backSeqno, 1),
+		Payload:       pl,
+	}
+
+	if err = peer.SendCustomMessage(t.closer, msg); err != nil {
+		return fmt.Errorf("send message to inbound tunnel failed: %w", err)
+	}
+	return nil
+}
+
+// serializeAndPad serializes a TL object and pads to tcpCellSize.
+// Returns the padded buffer (caller must not hold pool references across calls).
+func serializeAndPad(obj tl.Serializable) ([]byte, error) {
+	pl, err := tl.Serialize(obj, true)
+	if err != nil {
+		return nil, fmt.Errorf("serialize payload failed: %w", err)
+	}
+
+	if len(pl) < tcpCellSize {
+		padded := make([]byte, tcpCellSize)
+		copy(padded, pl)
+		for i := len(pl); i < tcpCellSize; i++ {
+			padded[i] = byte(rand.Uint32())
+		}
+		return padded, nil
+	}
+	return pl, nil
+}
+
+// HandleAck processes an incoming end-to-end ACK from the client.
+// Only marks cells acked and updates RTT; retransmission is the
+// exclusive job of retransmitLoop.
+func (t *TCPOut) HandleAck(p TCPAckPayload) {
+	t.mx.RLock()
+	tc := t.conns[p.ConnId]
+	t.mx.RUnlock()
+	if tc == nil {
+		return
+	}
+	tc.sendBuf.ProcessAck(p.AckSeqno, p.AckBitmap)
+}
+
+// HandleSendMe processes an incoming SendMe (credit grant) from the client.
+func (t *TCPOut) HandleSendMe(p SendMePayload) {
+	t.mx.RLock()
+	tc := t.conns[p.ConnId]
+	t.mx.RUnlock()
+	if tc == nil {
+		return
+	}
+	// Bounds-check the wire value before casting uint32 → int32. A
+	// malicious peer could otherwise send Credit > 2^31, wrap to a
+	// negative int32, and drain credits below zero (deadlocking the
+	// sender forever via WaitForCredit).
+	maxGrant := tc.credits.MaxCreditGrant()
+	if p.Credit == 0 || p.Credit > uint32(maxGrant) {
+		return
+	}
+	tc.credits.GrantCredits(int32(p.Credit))
+}
+
+// retransmitLoop runs periodically to retransmit unacknowledged cells.
+func (t *TCPOut) retransmitLoop() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.closer.Done():
+			return
+		case <-ticker.C:
+		}
+
+		t.mx.RLock()
+		conns := make(map[uint32]*tcpConn, len(t.conns))
+		for id, tc := range t.conns {
+			conns[id] = tc
+		}
+		t.mx.RUnlock()
+
+		for connId, tc := range conns {
+			cells, fatal := tc.sendBuf.GetRetransmissions()
+			if fatal {
+				t.log.Warn().Uint32("conn_id", connId).Msg("retransmit limit exceeded, closing connection")
+				tc.cancel()
+				tc.conn.Close()
+				t.mx.Lock()
+				delete(t.conns, connId)
+				t.mx.Unlock()
+				continue
+			}
+			for _, cell := range cells {
+				if err := t.sendBackRaw(cell.Data); err != nil {
+					t.log.Trace().Err(err).Uint32("conn_id", connId).Uint64("seqno", cell.Seqno).Msg("retransmit failed")
+				}
+			}
 		}
 	}
 }

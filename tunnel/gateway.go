@@ -28,6 +28,12 @@ import (
 
 var crcTable = crc64.MakeTable(crc64.ECMA)
 
+// maxInboundSections caps the number of active inbound sections per gateway
+// as a DoS guard. Without this an attacker can spray random SectionPubKeys
+// to force unbounded section + ECDH allocation. The cap is well above
+// legitimate usage and well below memory pressure thresholds.
+const maxInboundSections = 4096
+
 func init() {
 	tl.Register(Ping{}, "adnlTunnel.ping seqno:long = adnlTunnel.Ping")
 	tl.Register(Pong{}, "adnlTunnel.pong seqno:long = adnlTunnel.Pong")
@@ -133,6 +139,10 @@ type Section struct {
 	seqno       SeqnoWindow
 	seqnoCached SeqnoWindow
 
+	hopBuf      *HopBuffer
+	gapDetector *GapDetector
+	lastNACKAt  int64 // unix nanos, for rate limiting NACKs
+
 	lastOnceLogAt int64
 	log           zerolog.Logger
 	mx            sync.RWMutex
@@ -198,7 +208,17 @@ type PaymentConfig struct {
 	MinPricePerPacketInOut uint64
 }
 
-func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, logger zerolog.Logger, pay PaymentConfig, allowClearnet bool) *Gateway {
+func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, logger zerolog.Logger, pay PaymentConfig, allowClearnet bool, clearnetPorts []int, maxTCPConns int) *Gateway {
+	ports := defaultClearnetPorts()
+	if len(clearnetPorts) > 0 {
+		ports = make(map[int]bool, len(clearnetPorts))
+		for _, p := range clearnetPorts {
+			ports[p] = true
+		}
+	}
+	if maxTCPConns <= 0 {
+		maxTCPConns = 64
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	g := &Gateway{
 		gate:             gate,
@@ -207,8 +227,8 @@ func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, log
 		allowRouting:     true,
 		allowOut:         true,
 		allowClearnet:     allowClearnet,
-		clearnetPorts:     defaultClearnetPorts(),
-		maxTCPConns:       64,
+		clearnetPorts:     ports,
+		maxTCPConns:       maxTCPConns,
 		clearnetBlacklist: defaultClearnetBlacklist(),
 		paymentNode:       nil,
 		activePeers:      map[string]*Peer{},
@@ -501,6 +521,38 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				return fmt.Errorf("repeating cached packet")
 			}
 
+			// Layer 2: store for NACK retransmission and detect gaps.
+			if sec.hopBuf != nil {
+				if raw, err := tl.Serialize(m, true); err == nil {
+					sec.hopBuf.Store(m.Seqno, raw)
+				} else {
+					sec.logOnce().Err(err).Msg("serialize for hop buffer failed")
+				}
+			}
+			if sec.gapDetector != nil {
+				// Observe updates the gap detector state on every packet.
+				sec.gapDetector.Observe(m.Seqno)
+
+				// Only drain expired gaps if the rate limit allows sending a NACK.
+				// Otherwise the gaps stay in the pending map for the next cycle.
+				now := time.Now().UnixNano()
+				if last := atomic.LoadInt64(&sec.lastNACKAt); now-last >= int64(10*time.Millisecond) {
+					if atomic.CompareAndSwapInt64(&sec.lastNACKAt, last, now) {
+						if gaps := sec.gapDetector.ExpiredGaps(); len(gaps) > 0 {
+							if len(gaps) > 16 {
+								gaps = gaps[:16]
+							}
+							if err := peer.SendCustomMessage(context.Background(), SectionNACKPayload{
+								SectionKey:    m.SectionPubKey,
+								MissingSeqnos: gaps,
+							}); err != nil {
+								sec.logOnce().Err(err).Msg("send section NACK failed")
+							}
+						}
+					}
+				}
+			}
+
 			if len(sec.cachedActions) == 0 {
 				return fmt.Errorf("cache is empty")
 			}
@@ -517,8 +569,19 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			sec := g.inboundSections[string(m.SectionPubKey)]
 			g.mx.RUnlock()
 
-			// TODO: random tunnel creation ddos protection
 			if sec == nil {
+				// DoS guard: cap the total number of active sections per
+				// gateway. Without this an attacker can spray random
+				// SectionPubKeys to force unbounded section + ECDH allocation.
+				// 4096 is well above legitimate usage (hundreds of tunnels)
+				// and well below memory pressure thresholds.
+				g.mx.RLock()
+				sectionCount := len(g.inboundSections)
+				g.mx.RUnlock()
+				if sectionCount >= maxInboundSections {
+					return fmt.Errorf("inbound section limit reached (%d), rejecting new section", maxInboundSections)
+				}
+
 				shKey, err := keys.SharedKey(g.key, m.SectionPubKey)
 				if err != nil {
 					return fmt.Errorf("shared key calc failed: %v", err)
@@ -532,6 +595,8 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 					routes:       map[uint32]*Route{},
 					payments:     map[string]*PaymentChannel{},
 					lastPacketAt: time.Now().Unix(),
+					hopBuf:      NewHopBuffer(),
+					gapDetector: NewGapDetector(25 * time.Millisecond),
 					log: g.log.With().
 						Str("from_addr", peer.getConn().RemoteAddr()).
 						Str("from_adnl", base64.StdEncoding.EncodeToString(peer.id)).
@@ -540,6 +605,11 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				sec.log.Info().Msg("inbound section created")
 
 				g.mx.Lock()
+				// Re-check under write lock to avoid TOCTOU race.
+				if len(g.inboundSections) >= maxInboundSections {
+					g.mx.Unlock()
+					return fmt.Errorf("inbound section limit reached (%d), rejecting new section", maxInboundSections)
+				}
 				g.inboundSections[string(m.SectionPubKey)] = sec
 				g.mx.Unlock()
 
@@ -566,6 +636,27 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				if err = inst.(Instruction).Execute(g.closerCtx, sec, &m, restInstructions); err != nil {
 					sec.logOnce().Int("index", i).Type("instruction", inst).Err(err).Msg("execute instruction failed")
 					return fmt.Errorf("execute instruction %d (%T) error: %w", i, inst, err)
+				}
+			}
+		case SectionNACKPayload:
+			g.mx.RLock()
+			sec := g.inboundSections[string(m.SectionKey)]
+			g.mx.RUnlock()
+
+			if sec == nil {
+				return fmt.Errorf("section not found for NACK")
+			}
+
+			missing := m.MissingSeqnos
+			if len(missing) > 16 {
+				missing = missing[:16]
+			}
+
+			for _, seq := range missing {
+				if data, ok := sec.hopBuf.Get(seq); ok {
+					if err := peer.SendCustomMessage(context.Background(), tl.Raw(data)); err != nil {
+						sec.logOnce().Uint32("seqno", seq).Err(err).Msg("NACK retransmit failed")
+					}
 				}
 			}
 		default:
