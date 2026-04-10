@@ -492,7 +492,7 @@ func checkAndDeployPaymentChannels(ctx context.Context, apiClient ton.APIClientW
 		}
 
 		if len(sec.Payment.Chain) == 0 {
-			return fmt.Errorf("no payment nodes chain specified in config for node " + base64.StdEncoding.EncodeToString(sec.Key))
+			return fmt.Errorf("no payment nodes chain specified in config for node %s", base64.StdEncoding.EncodeToString(sec.Key))
 		}
 
 		if sec.Payment != nil {
